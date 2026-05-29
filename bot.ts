@@ -27,7 +27,7 @@ let bridgeProcess: any = null;
 function startBridge() {
   if (bridgeProcess) return;
   bridgeProcess = spawn('node', ['proxy_bridge.mjs'], {
-    cwd: '/root/topsurveys-bot',
+    cwd: '/root/Survey-Bot',
     stdio: 'ignore',
     detached: true,
   });
@@ -1595,8 +1595,8 @@ bot.on('document', async ctx => {
     const buffer = Buffer.from(await response.arrayBuffer());
     
     const fs = await import('fs');
-    const filePath = `/root/topsurveys-bot/uploads/${doc.file_name}`;
-    fs.mkdirSync('/root/topsurveys-bot/uploads', { recursive: true });
+    const filePath = `/root/Survey-Bot/uploads/${doc.file_name}`;
+    fs.mkdirSync('/root/Survey-Bot/uploads', { recursive: true });
     fs.writeFileSync(filePath, buffer);
     
     try {
