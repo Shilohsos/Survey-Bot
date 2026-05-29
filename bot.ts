@@ -3,11 +3,15 @@ import { Telegraf } from 'telegraf';
 import { chromium } from 'playwright';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { spawn } from 'child_process';
+import { launchStealthBrowser, applyStealthToPage, answerQuestion, pickBestOption, generateTextAnswer, checkAndWithdraw, getWithdrawalInfo } from './src/botIntegrations.js';
+import { attemptWithdrawal } from './src/autoWithdraw.js';
 
 const BOT_TOKEN = process.env.BOT_TOKEN!;
 const ADMIN_ID = Number(process.env.ADMIN_ID || '0');
 const EMAIL = process.env.TS_EMAIL || '';
 const PASSWORD = process.env.TS_PASSWORD || '';
+const CRYPTO_WALLET = process.env.CRYPTO_WALLET || '';
+const WITHDRAWAL_THRESHOLD = parseFloat(process.env.WITHDRAWAL_THRESHOLD || '5.0');
 
 if (!BOT_TOKEN) throw new Error('BOT_TOKEN missing from .env');
 if (!ADMIN_ID) throw new Error('ADMIN_ID missing');
@@ -104,15 +108,15 @@ async function doLogin(): Promise<string> {
   startBridge();
   await new Promise(r => setTimeout(r, 1000)); // wait for bridge
 
-  console.log('[login] launching browser...');
-  const browser = await chromium.launch({
-    headless: true,
-    proxy: { server: `socks5://127.0.0.1:${BRIDGE_PORT}` },
-    args: ['--no-sandbox'],
-  });
+  console.log('[login] launching browser (stealth)...');
+  const { browser, context } = await launchStealthBrowser(
+    true,
+    `socks5://127.0.0.1:${BRIDGE_PORT}`
+  );
 
   try {
-    const page = await browser.newPage();
+    const page = await context.newPage();
+    applyStealthToPage(page);
 
     await page.goto('https://app.topsurveys.app/app-login', { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(1000);
@@ -320,14 +324,15 @@ async function scrapeSurveys(): Promise<any[]> {
     startBridge();
     await new Promise(r => setTimeout(r, 1000));
     
-    const browser = await chromium.launch({
-      headless: true,
-      proxy: { server: `socks5://127.0.0.1:${BRIDGE_PORT}` },
-      args: ['--no-sandbox'],
-    });
+    console.log('[scrape] launching browser (stealth)...');
+    const { browser, context } = await launchStealthBrowser(
+      true,
+      `socks5://127.0.0.1:${BRIDGE_PORT}`
+    );
 
     try {
-      const page = await browser.newPage();
+      const page = await context.newPage();
+      applyStealthToPage(page);
       const surveys = await attemptScrape(browser, page);
       
       // If we got 0 surveys and the onboarding popup wasn't the cause,
@@ -954,14 +959,15 @@ async function openAndTakeSurvey(ctx: any, preferredSurvey: any, chatId: number)
     startBridge();
     await new Promise(r => setTimeout(r, 1000));
 
-    const browser = await chromium.launch({
-      headless: true,
-      proxy: { server: `socks5://127.0.0.1:${BRIDGE_PORT}` },
-      args: ['--no-sandbox'],
-    });
+    console.log('[survey] launching browser (stealth)...');
+    const { browser, context: surveyContext } = await launchStealthBrowser(
+      true,
+      `socks5://127.0.0.1:${BRIDGE_PORT}`
+    );
 
     try {
-      const page = await browser.newPage();
+      const page = await surveyContext.newPage();
+      applyStealthToPage(page);
       // tsx injects __name helper — define it in page context
       await page.evaluate(() => { (window as any).__name = () => {}; }).catch(() => {});
       await page.context().addCookies([
@@ -1144,33 +1150,51 @@ async function openAndTakeSurvey(ctx: any, preferredSurvey: any, chatId: number)
           return items;
         });
 
-        // Match options against PERSONA (in Node.js, not browser)
+        // Match options using LLM for context-aware selection
         let chosenOption: { type: string; text: string; selector: string } | null = null;
         if (qualOptions.length > 0) {
-          const lowerText = qualOptions.map(o => o.text.toLowerCase());
+          // Try LLM first for smarter selection
+          try {
+            const optionTexts = qualOptions.map(o => o.text);
+            const llmAnswer = await pickBestOption(
+              'Please select the most appropriate option for a market research survey qualification question.',
+              optionTexts,
+              'survey qualification'
+            );
+            // Find the option matching the LLM answer
+            const matched = qualOptions.find(o => 
+              o.text.toLowerCase() === llmAnswer.toLowerCase() ||
+              o.text.toLowerCase().includes(llmAnswer.toLowerCase()) ||
+              llmAnswer.toLowerCase().includes(o.text.toLowerCase())
+            );
+            if (matched) {
+              chosenOption = matched;
+              console.log(`[qual] LLM picked: "${llmAnswer}"`);
+            }
+          } catch {}
           
-          // Priority matching: check each option against persona fields
-          const matchPrio = [
-            { key: 'gender', keywords: [PERSONA.gender.toLowerCase()] },
-            { key: 'age', keywords: [PERSONA.age] },
-            { key: 'education', keywords: PERSONA.education.map(k => k.toLowerCase()) },
-            { key: 'employment', keywords: PERSONA.employment.map(k => k.toLowerCase()) },
-            { key: 'marital', keywords: PERSONA.maritalStatus.map(k => k.toLowerCase()) },
-            { key: 'income', keywords: PERSONA.income.map(k => k.toLowerCase()) },
-            { key: 'occupation', keywords: PERSONA.occupation.map(k => k.toLowerCase()) },
-            { key: 'housing', keywords: PERSONA.housing.map(k => k.toLowerCase()) },
-            { key: 'interests', keywords: PERSONA.interests.map(k => k.toLowerCase()) },
-            { key: 'languages', keywords: PERSONA.languages.map(k => k.toLowerCase()) },
-          ];
-
-          for (const matcher of matchPrio) {
-            chosenOption = qualOptions.find(o => matcher.keywords.some(k => o.text.toLowerCase().includes(k))) || null;
-            if (chosenOption) break;
-          }
-
-          // Fallback: pick first option
+          // Fallback to persona pattern matching if LLM failed
           if (!chosenOption) {
-            chosenOption = qualOptions[0];
+            // Use the old PERSONA keyword matching as fallback
+            const matchPrio = [
+              { key: 'gender', keywords: [PERSONA.gender.toLowerCase()] },
+              { key: 'age', keywords: [PERSONA.age] },
+              { key: 'education', keywords: PERSONA.education.map(k => k.toLowerCase()) },
+              { key: 'employment', keywords: PERSONA.employment.map(k => k.toLowerCase()) },
+              { key: 'marital', keywords: PERSONA.maritalStatus.map(k => k.toLowerCase()) },
+              { key: 'income', keywords: PERSONA.income.map(k => k.toLowerCase()) },
+              { key: 'occupation', keywords: PERSONA.occupation.map(k => k.toLowerCase()) },
+              { key: 'housing', keywords: PERSONA.housing.map(k => k.toLowerCase()) },
+              { key: 'interests', keywords: PERSONA.interests.map(k => k.toLowerCase()) },
+              { key: 'languages', keywords: PERSONA.languages.map(k => k.toLowerCase()) },
+            ];
+            for (const matcher of matchPrio) {
+              chosenOption = qualOptions.find(o => matcher.keywords.some(k => o.text.toLowerCase().includes(k))) || null;
+              if (chosenOption) break;
+            }
+            if (!chosenOption) {
+              chosenOption = qualOptions[0];
+            }
           }
         }
 
@@ -1290,6 +1314,29 @@ async function openAndTakeSurvey(ctx: any, preferredSurvey: any, chatId: number)
         const rewardVal = parseSurveyReward(chosenCard.reward || '0');
         sessionHistory.totalEarned += rewardVal;
         await sendStatus(ctx, `✅ *Completed!* +${chosenCard.reward || '?'} 💰`);
+
+        // Auto-withdrawal check
+        if (CRYPTO_WALLET) {
+          const newBalance = userData.balance !== undefined ? userData.balance : 0;
+          if (newBalance >= WITHDRAWAL_THRESHOLD) {
+            sendStatus(ctx, `💰 Balance €${newBalance} >= threshold — checking withdrawal...`);
+            checkAndWithdraw(
+              authToken!,
+              savedCookies,
+              savedLocalStorage,
+              savedSessionStorage,
+              newBalance,
+              async (result) => {
+                if (result.success) {
+                  await sendStatus(ctx, `✅ *Withdrawal initiated!* TX: ${result.txHash || 'pending'}`);
+                } else if (result.attempted) {
+                  await sendStatus(ctx, `⚠️ Withdrawal: ${result.message}`);
+                }
+              }
+            ).catch(() => {});
+          }
+        }
+
         return { completed: true, reward: chosenCard.reward || '' };
       } else {
         sessionHistory.totalScreened++;
@@ -1476,6 +1523,62 @@ bot.action('logout', async ctx => {
   userData = {};
   profileData = {};
   await ctx.reply('🔓 Logged out.', menu());
+});
+
+// ─── /withdraw command ─────────────────────────────────────────────────────
+
+bot.command('withdraw', async ctx => {
+  if (!loggedIn || !authToken) {
+    return ctx.reply('❌ Not logged in. Use /start first.', menu());
+  }
+
+  if (!CRYPTO_WALLET) {
+    return ctx.reply('⚠️ No wallet configured. Set CRYPTO_WALLET in .env', menu());
+  }
+
+  const msg = await ctx.reply('💰 Checking balance...');
+  try {
+    // Fetch fresh balance
+    const res = await socksFetch('https://api.topsurveys.app/api/user', {
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    if (!res.ok) throw new Error('API error');
+    const data: any = await res.json();
+    const balance = typeof data.balance === 'number' ? data.balance : 0;
+
+    const info = getWithdrawalInfo(balance);
+
+    if (!info.canWithdraw) {
+      await ctx.telegram.editMessageText(ctx.chat!.id, msg.message_id, undefined,
+        `💰 *Balance:* €${balance.toFixed(2)}\n⚠️ Need €${info.threshold.toFixed(2)} minimum to withdraw.\n📝 Set CRYPTO_WALLET in .env`,
+        { parse_mode: 'Markdown', ...menu() }
+      );
+      return;
+    }
+
+    await ctx.telegram.editMessageText(ctx.chat!.id, msg.message_id, undefined,
+      `💰 Balance: €${balance.toFixed(2)}\n⏳ Attempting withdrawal to crypto wallet...`,
+      { parse_mode: 'Markdown' }
+    );
+
+    const result = await attemptWithdrawal(
+      authToken,
+      savedCookies,
+      savedLocalStorage,
+      savedSessionStorage
+    );
+
+    const status = result.success ? '✅' : '❌';
+    await ctx.telegram.editMessageText(ctx.chat!.id, msg.message_id, undefined,
+      `${status} *Withdrawal:* ${result.message}`,
+      { parse_mode: 'Markdown', ...menu() }
+    );
+  } catch (err: any) {
+    await ctx.telegram.editMessageText(ctx.chat!.id, msg.message_id, undefined,
+      `❌ Withdrawal failed: ${escMd(err.message)}`,
+      { parse_mode: 'Markdown', ...menu() }
+    );
+  }
 });
 
 // ─── Document handler (PDF reading) ─────────────────────────────────────

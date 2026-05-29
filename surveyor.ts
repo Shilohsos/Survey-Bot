@@ -1,5 +1,6 @@
 import { chromium, type Browser, type Page } from 'playwright';
 import { getAvailableSurveys, getSurveyLink, claimReward, login as tsLogin } from './topsurveys.js';
+import { generateAnswer, type AnswerRequest } from './src/llmEngine.js';
 
 const PROXY = process.env.PROXY || '';
 const PROXY_USER = process.env.PROXY_USER || '';
@@ -17,6 +18,23 @@ let onProgress: ProgressCb = async () => {};
 let onSurveyFound: SurveyCb = async () => {};
 let onEarned: EarnedCb = async () => {};
 let onError: ErrorCb = async () => {};
+
+// ─── LLM Answer Cache (for this session only) ────────────────────────
+
+const answerCache = new Map<string, string>();
+
+function getCachedAnswer(key: string): string | undefined {
+  return answerCache.get(key);
+}
+
+function setCachedAnswer(key: string, answer: string): void {
+  answerCache.set(key, answer);
+  // Keep cache limited
+  if (answerCache.size > 500) {
+    const firstKey = answerCache.keys().next().value;
+    if (firstKey) answerCache.delete(firstKey);
+  }
+}
 
 function buildProxyConfig() {
   if (!PROXY) return undefined;
@@ -52,7 +70,6 @@ async function loginToDashboard(context: any, email: string, password: string, a
 }
 
 async function waitForSurveyPage(page: Page): Promise<boolean> {
-  // Wait for either a survey page or the TopSurveys dashboard to load
   try {
     await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
     await page.waitForTimeout(5000);
@@ -140,8 +157,8 @@ export const surveyor = {
                 await page.goto(surveyUrl, { waitUntil: 'networkidle', timeout: 60_000 });
                 await onProgress(`📋 Survey: ${survey.title || survey.name}\n⏳ Completing survey...`);
 
-                // Attempt to complete the survey
-                const completed = await attemptSurvey(page);
+                // Attempt to complete the survey with LLM-powered answers
+                const completed = await attemptSurveyWithLLM(page);
 
                 if (completed) {
                   await page.close();
@@ -210,57 +227,11 @@ export const surveyor = {
   },
 };
 
-// ─── Survey completion logic ──────────────────────────────────────────
+// ─── LLM-Powered Survey Completion ──────────────────────────────────
 
-async function attemptSurvey(page: Page): Promise<boolean> {
+async function attemptSurveyWithLLM(page: Page): Promise<boolean> {
   try {
-    // Wait for the page to load
     await page.waitForLoadState('networkidle', { timeout: 30_000 }).catch(() => {});
-    await page.waitForTimeout(3_000);
-
-    // Identify the survey type and attempt
-    const url = page.url().toLowerCase();
-
-    // Handle different survey platforms
-    const platforms = [
-      { pattern: 'cint', handler: handleCintSurvey },
-      { pattern: 'dynata', handler: handleDynataSurvey },
-      { pattern: 'sample', handler: handleGenericSurvey },
-      { pattern: 'survey', handler: handleGenericSurvey },
-      { pattern: 'opinion', handler: handleGenericSurvey },
-      { pattern: 'question', handler: handleGenericSurvey },
-    ];
-
-    for (const platform of platforms) {
-      if (url.includes(platform.pattern)) {
-        return await platform.handler(page);
-      }
-    }
-
-    // Generic fallback for unknown survey types
-    return await handleGenericSurvey(page);
-  } catch (err) {
-    return false;
-  }
-}
-
-async function handleCintSurvey(page: Page): Promise<boolean> {
-  return await genericFormFiller(page);
-}
-
-async function handleDynataSurvey(page: Page): Promise<boolean> {
-  return await genericFormFiller(page);
-}
-
-async function handleGenericSurvey(page: Page): Promise<boolean> {
-  return await genericFormFiller(page);
-}
-
-// ─── Generic form filler ──────────────────────────────────────────────
-
-async function genericFormFiller(page: Page): Promise<boolean> {
-  try {
-    // Wait for content to stabilize
     await page.waitForTimeout(3_000);
 
     // Maximum time to spend on one survey
@@ -271,33 +242,31 @@ async function genericFormFiller(page: Page): Promise<boolean> {
     let screensPassed = 0;
 
     while (Date.now() - startTime < maxDuration) {
-      // Check if we've reached a completion page
       const bodyText = await page.evaluate(() => document.body?.innerText?.toLowerCase() || '');
+
+      // Completion check
       const completionIndicators = [
         'thank you', 'completed', 'finished', 'survey complete',
         'you have completed', 'congratulations', 'submitted',
         'your response', 'recorded', 'success',
       ];
-
       if (completionIndicators.some(ind => bodyText.includes(ind))) {
-        // Wait a moment to ensure the completion is registered
         await page.waitForTimeout(2_000);
         return questionsAnswered > 0;
       }
 
-      // Check for screening/termination
+      // Screening check
       const terminationIndicators = [
         'not qualify', 'screened out', 'over quota', 'quota full',
         'not match', 'does not match', 'unfortunately', 'we are sorry',
         'terminated', 'disqualified',
       ];
-
       if (terminationIndicators.some(ind => bodyText.includes(ind))) {
         return false;
       }
 
-      // Find and interact with questions
-      const interacted = await interactWithPage(page);
+      // LLM-powered interaction
+      const interacted = await interactWithPageLLM(page);
       if (interacted) {
         questionsAnswered++;
         screensPassed = 0;
@@ -305,7 +274,6 @@ async function genericFormFiller(page: Page): Promise<boolean> {
       } else {
         screensPassed++;
         if (screensPassed > 5) {
-          // No progress — try clicking Continue/Next/Submit
           const clicked = await tryClickContinue(page);
           if (!clicked) {
             await page.waitForTimeout(3_000);
@@ -323,65 +291,242 @@ async function genericFormFiller(page: Page): Promise<boolean> {
   }
 }
 
-async function interactWithPage(page: Page): Promise<boolean> {
+// ─── LLM-Powered Page Interaction ───────────────────────────────────
+
+/**
+ * Uses DeepSeek LLM to intelligently answer survey questions instead of random selection.
+ * Caches answers to avoid redundant API calls for identical questions.
+ */
+async function interactWithPageLLM(page: Page): Promise<boolean> {
   try {
-    // Detect question types and interact
-    const selectors = [
-      // Radio buttons
-      'input[type="radio"]',
-      // Checkboxes
-      'input[type="checkbox"]',
-      // Rating scales
-      '.rating-cell, .rating-item, [class*="rating"]',
-      // Star ratings
-      '.star, [class*="star"]',
-      // Likert scales
-      '.likert, [class*="likert"]',
-      // Dropdowns
-      'select',
-      // Text/textarea
-      'input[type="text"], input[type="email"], input[type="number"], textarea',
-      // Sliders
-      'input[type="range"]',
-      // Single select buttons
-      '.choice-item, .option-item, [class*="option"], [class*="choice"]',
-      // Matrix tables
-      'table input[type="radio"]',
-    ];
-
-    for (const selector of selectors) {
-      const elements = await page.$$(selector);
-      if (elements.length > 0) {
-        // Pick a random element and interact
-        const element = elements[Math.floor(Math.random() * elements.length)];
-        const tag = await element.evaluate(el => el.tagName.toLowerCase());
-        const type = await element.evaluate(el => (el as HTMLInputElement).type || '');
-
-        if (tag === 'select') {
-          const options = await element.$$('option');
-          // Skip the first option if it's a placeholder
-          const firstSelected = await element.evaluate(el => (el as HTMLSelectElement).selectedIndex);
-          const validOptions = firstSelected === 0 ? options.slice(1) : options;
-          if (validOptions.length > 0) {
-            const randomOption = validOptions[Math.floor(Math.random() * validOptions.length)];
-            const value = await randomOption.getAttribute('value');
-            if (value) {
-              await element.selectOption(value);
-              return true;
-            }
-          }
-        } else if (tag === 'textarea' || type === 'text' || type === 'email' || type === 'number') {
-          const answers = ['Yes', 'No', 'Maybe', 'Sometimes', 'Often', 'Rarely', 'Weekly', 'Monthly', 'Good', 'Average'];
-          await element.fill(answers[Math.floor(Math.random() * answers.length)]);
-          return true;
-        } else if (type === 'radio' || type === 'checkbox') {
-          await element.click();
-          return true;
-        } else {
-          await element.click();
-          return true;
+    // Extract the visible question text and options from the page
+    const pageData = await page.evaluate(() => {
+      // Get the main question text (look for headings, labels, etc.)
+      const questionEls = document.querySelectorAll('h1, h2, h3, h4, .question-text, [class*="question"], .title, [class*="title"], legend, .heading');
+      let questionText = '';
+      for (const el of questionEls) {
+        const text = (el as HTMLElement).innerText?.trim();
+        if (text && text.length > 5 && text.length < 500) {
+          questionText = text;
+          break;
         }
       }
+
+      // Fallback: use page title or first significant text block
+      if (!questionText) {
+        const body = document.body?.innerText || '';
+        const firstLines = body.split('\n').filter(l => l.trim().length > 10);
+        questionText = firstLines[0] || '';
+      }
+
+      // Get all visible interactive elements with their text
+      const elements: { tag: string; type: string; text: string; value?: string }[] = [];
+
+      // Radio buttons
+      document.querySelectorAll('input[type="radio"]').forEach(el => {
+        const parent = el.parentElement;
+        const text = parent ? (parent.textContent || '').trim() : (el as HTMLInputElement).value || '';
+        if (text) elements.push({ tag: 'input', type: 'radio', text });
+      });
+
+      // Checkboxes
+      document.querySelectorAll('input[type="checkbox"]').forEach(el => {
+        const parent = el.parentElement;
+        const text = parent ? (parent.textContent || '').trim() : (el as HTMLInputElement).value || '';
+        if (text) elements.push({ tag: 'input', type: 'checkbox', text });
+      });
+
+      // If no radio/checkbox found, look for styled choice elements
+      if (elements.length === 0) {
+        document.querySelectorAll('.choice-item, .option-item, [class*="option"], [class*="choice"], label, .item, [role="radio"], [role="checkbox"], [role="option"]').forEach(el => {
+          const text = (el.textContent || '').trim();
+          const style = window.getComputedStyle(el);
+          if (text && text.length < 200 && style.display !== 'none' && style.visibility !== 'hidden') {
+            elements.push({ tag: el.tagName.toLowerCase(), type: 'choice', text });
+          }
+        });
+      }
+
+      // Dropdown selects
+      const selects = document.querySelectorAll('select');
+      const selectOptions: { text: string; value: string }[] = [];
+      selects.forEach(sel => {
+        const opts = sel.querySelectorAll('option');
+        opts.forEach(opt => {
+          const text = (opt.textContent || '').trim();
+          const value = opt.getAttribute('value') || '';
+          if (text) selectOptions.push({ text, value });
+        });
+      });
+
+      // Text inputs (if visible)
+      const textInputs = document.querySelectorAll('input[type="text"], input:not([type]):not([type="hidden"]), textarea');
+      const hasTextInput = textInputs.length > 0;
+
+      // Rating/slider
+      const ratingInputs = document.querySelectorAll('input[type="range"]');
+      const hasRating = ratingInputs.length > 0;
+
+      // Star ratings
+      const stars = document.querySelectorAll('.star, [class*="star"], .rating-item');
+      const hasStars = stars.length > 0;
+
+      return {
+        questionText: questionText.substring(0, 500),
+        options: elements.map(e => e.text).filter(t => t.length > 0),
+        selectOptions: selectOptions.map(o => o.text),
+        hasTextInput,
+        hasRating,
+        hasStars,
+        elements, // Full element data for interaction
+        selectElements: selects.length,
+      };
+    });
+
+    // ── Handle different question types ──────────────────────────────
+
+    // Type 1: Radio/Choice options
+    if (pageData.options.length > 0) {
+      const cacheKey = `choice|${pageData.questionText.substring(0, 100)}|${pageData.options.join(',')}`;
+      let chosenAnswer = getCachedAnswer(cacheKey);
+
+      if (!chosenAnswer) {
+        // Ask LLM to pick the best option
+        const result = await generateAnswer({
+          questionText: pageData.questionText,
+          options: pageData.options,
+          inputType: 'radio',
+          maxTokens: 30,
+        });
+        chosenAnswer = result.answer;
+        setCachedAnswer(cacheKey, chosenAnswer);
+      }
+
+      // Click the chosen option by matching text
+      const clicked = await page.evaluate(({ answer, elements }) => {
+        const ans = answer.toLowerCase();
+        for (const el of elements) {
+          if (el.text.toLowerCase() === ans || el.text.toLowerCase().includes(ans) || ans.includes(el.text.toLowerCase())) {
+            // Try different click strategies
+            const selector = el.type === 'radio' || el.type === 'checkbox'
+              ? `input[type="${el.type}"][value="${el.text}"]`
+              : null;
+
+            if (selector) {
+              const input = document.querySelector(selector) as HTMLElement;
+              if (input) { input.click(); return true; }
+            }
+
+            // Fallback: find element by text
+            const all = document.querySelectorAll('label, .choice-item, .option-item, [class*="option"], [class*="choice"], [role="radio"], [role="checkbox"], [role="option"]');
+            for (const el2 of all) {
+              if ((el2.textContent || '').trim() === el.text) {
+                (el2 as HTMLElement).click();
+                return true;
+              }
+            }
+          }
+        }
+        return false;
+      }, { answer: chosenAnswer, elements: pageData.elements });
+
+      return clicked;
+    }
+
+    // Type 2: Dropdown/Select
+    if (pageData.selectOptions.length > 0) {
+      const cacheKey = `select|${pageData.questionText.substring(0, 100)}|${pageData.selectOptions.join(',')}`;
+      let chosenAnswer = getCachedAnswer(cacheKey);
+
+      if (!chosenAnswer) {
+        const result = await generateAnswer({
+          questionText: pageData.questionText,
+          options: pageData.selectOptions,
+          inputType: 'select',
+          maxTokens: 20,
+        });
+        chosenAnswer = result.answer;
+        setCachedAnswer(cacheKey, chosenAnswer);
+      }
+
+      // Select the option by matching text
+      const selected = await page.evaluate((answer: string) => {
+        const selects = document.querySelectorAll('select');
+        if (selects.length === 0) return false;
+        const select = selects[0];
+        const options = select.querySelectorAll('option');
+        const ans = answer.toLowerCase();
+        for (let i = 0; i < options.length; i++) {
+          const text = (options[i].textContent || '').trim().toLowerCase();
+          if (text === ans || text.includes(ans) || ans.includes(text)) {
+            select.selectedIndex = i;
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+          }
+        }
+        // Fallback: pick second option (skip placeholder)
+        if (options.length > 1) {
+          select.selectedIndex = 1;
+          select.dispatchEvent(new Event('change', { bubbles: true }));
+          return true;
+        }
+        return false;
+      }, chosenAnswer);
+
+      return selected;
+    }
+
+    // Type 3: Text input
+    if (pageData.hasTextInput) {
+      const cacheKey = `text|${pageData.questionText.substring(0, 100)}`;
+      let answer = getCachedAnswer(cacheKey);
+
+      if (!answer) {
+        const result = await generateAnswer({
+          questionText: pageData.questionText,
+          inputType: 'text',
+          maxTokens: 15,
+        });
+        answer = result.answer || 'Yes';
+        setCachedAnswer(cacheKey, answer);
+      }
+
+      // Fill first visible text input
+      await page.evaluate((text: string) => {
+        const inputs = document.querySelectorAll('input[type="text"], input:not([type]):not([type="hidden"]), textarea');
+        for (const input of inputs) {
+          const style = window.getComputedStyle(input);
+          if (style.display !== 'none' && style.visibility !== 'hidden') {
+            (input as HTMLInputElement).value = text;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            return true;
+          }
+        }
+      }, answer);
+      return true;
+    }
+
+    // Type 4: Rating/Slider
+    if (pageData.hasRating) {
+      const result = await generateAnswer({
+        questionText: pageData.questionText,
+        inputType: 'rating',
+        maxTokens: 5,
+      });
+      const rating = parseInt(result.answer) || 5;
+      await page.evaluate((val: number) => {
+        const ranges = document.querySelectorAll('input[type="range"]');
+        if (ranges.length > 0) {
+          const range = ranges[0] as HTMLInputElement;
+          const max = parseInt(range.max) || 10;
+          const min = parseInt(range.min) || 0;
+          range.value = String(Math.min(Math.max(val, min), max));
+          range.dispatchEvent(new Event('input', { bubbles: true }));
+          range.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }, rating);
+      return true;
     }
 
     return false;
@@ -389,6 +534,8 @@ async function interactWithPage(page: Page): Promise<boolean> {
     return false;
   }
 }
+
+// ─── Continue button clicker (unchanged) ─────────────────────────────
 
 async function tryClickContinue(page: Page): Promise<boolean> {
   const buttonTexts = [
@@ -425,7 +572,7 @@ async function tryClickContinue(page: Page): Promise<boolean> {
   return false;
 }
 
-// ─── Utility ──────────────────────────────────────────────────────────
+// ─── Utility ─────────────────────────────────────────────────────────
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
