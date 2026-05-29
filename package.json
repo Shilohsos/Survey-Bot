@@ -1,0 +1,22 @@
+{
+  "name": "topsurveys-bot",
+  "version": "1.0.0",
+  "description": "TopSurveys auto-survey bot",
+  "main": "bot.ts",
+  "type": "module",
+  "scripts": {
+    "start": "npx tsx bot.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.16.1",
+    "dotenv": "^17.4.2",
+    "playwright": "^1.60.0",
+    "socks-proxy-agent": "^10.0.0",
+    "telegraf": "^4.16.3",
+    "tsx": "^4.22.3"
+  }
+}
