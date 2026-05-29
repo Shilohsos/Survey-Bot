@@ -4,12 +4,15 @@
  */
 
 import net from 'net';
+import { config } from 'dotenv';
 
-const LOCAL_PORT = 10801;
-const REMOTE_HOST = '159.100.17.112';
-const REMOTE_PORT = 9000;
-const REMOTE_USER = 'kelvin';
-const REMOTE_PASS = 'kelvin';
+config(); // Load .env
+
+const LOCAL_PORT = parseInt(process.env.BRIDGE_LOCAL_PORT || '10801');
+const REMOTE_HOST = process.env.PROXY_HOST || '159.100.17.112';
+const REMOTE_PORT = parseInt(process.env.PROXY_PORT || '9000');
+const REMOTE_USER = process.env.PROXY_USER || 'kelvin';
+const REMOTE_PASS = process.env.PROXY_PASS || 'kelvin';
 
 console.log(`🔄 SOCKS5 bridge: 127.0.0.1:${LOCAL_PORT} (no auth) → ${REMOTE_HOST}:${REMOTE_PORT}`);
 

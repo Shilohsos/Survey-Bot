@@ -26,6 +26,11 @@ let bridgeProcess: any = null;
 
 function startBridge() {
   if (bridgeProcess) return;
+  const proxyHost = process.env.PROXY_HOST;
+  if (!proxyHost) {
+    console.log('[bridge] no PROXY_HOST set, running without proxy');
+    return;
+  }
   bridgeProcess = spawn('node', ['proxy_bridge.mjs'], {
     cwd: '/root/Survey-Bot',
     stdio: 'ignore',
@@ -109,9 +114,10 @@ async function doLogin(): Promise<string> {
   await new Promise(r => setTimeout(r, 1000)); // wait for bridge
 
   console.log('[login] launching browser (stealth)...');
+  const BRIDGE_ADDR = process.env.PROXY_HOST ? `socks5://127.0.0.1:${BRIDGE_PORT}` : undefined;
   const { browser, context } = await launchStealthBrowser(
     true,
-    `socks5://127.0.0.1:${BRIDGE_PORT}`
+    BRIDGE_ADDR
   );
 
   try {
@@ -325,9 +331,10 @@ async function scrapeSurveys(): Promise<any[]> {
     await new Promise(r => setTimeout(r, 1000));
     
     console.log('[scrape] launching browser (stealth)...');
+    const BRIDGE_ADDR = process.env.PROXY_HOST ? `socks5://127.0.0.1:${BRIDGE_PORT}` : undefined;
     const { browser, context } = await launchStealthBrowser(
       true,
-      `socks5://127.0.0.1:${BRIDGE_PORT}`
+      BRIDGE_ADDR
     );
 
     try {
@@ -960,9 +967,10 @@ async function openAndTakeSurvey(ctx: any, preferredSurvey: any, chatId: number)
     await new Promise(r => setTimeout(r, 1000));
 
     console.log('[survey] launching browser (stealth)...');
+    const BRIDGE_ADDR = process.env.PROXY_HOST ? `socks5://127.0.0.1:${BRIDGE_PORT}` : undefined;
     const { browser, context: surveyContext } = await launchStealthBrowser(
       true,
-      `socks5://127.0.0.1:${BRIDGE_PORT}`
+      BRIDGE_ADDR
     );
 
     try {
