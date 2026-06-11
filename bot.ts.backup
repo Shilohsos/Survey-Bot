@@ -25,11 +25,6 @@ const BRIDGE_PORT = 10801;
 let bridgeProcess: any = null;
 
 function startBridge() {
-  // Skip bridge start if externally managed
-  if (process.env.SKIP_BRIDGE_START === '1') {
-    console.log('[bridge] SKIP_BRIDGE_START set, not starting bridge');
-    return;
-  }
   if (bridgeProcess) return;
   const proxyHost = process.env.PROXY_HOST;
   if (!proxyHost) {
@@ -59,10 +54,7 @@ const PROXY_USER = process.env.PROXY_USER || '';
 const PROXY_PASS = process.env.PROXY_PASS || '';
 
 let socksAgent: any = undefined;
-// Use local SOCKS5 bridge as default proxy for API calls
-if (!PROXY || PROXY === '') {
-  socksAgent = new SocksProxyAgent(`socks5://127.0.0.1:${BRIDGE_PORT}`);
-} else if (PROXY) {
+if (PROXY) {
   let proxyUrl = PROXY;
   if (PROXY_USER && PROXY_PASS) {
     const withoutProto = proxyUrl.replace(/^socks5:\/\//, '');
@@ -115,66 +107,75 @@ let sessionHistory = {
   currentSurveyLabel: '',
 };
 
-// ─── Login via API through US bridge (bypasses SPA and Cloudflare) ───────
+// ─── Login via Playwright (through proxy bridge) ────────────────────────
 
 async function doLogin(): Promise<string> {
   startBridge();
-  await new Promise(r => setTimeout(r, 2000)); // wait for bridge
+  await new Promise(r => setTimeout(r, 1000)); // wait for bridge
 
-  console.log('[login] authenticating via API through US bridge...');
-  
+  console.log('[login] launching browser (stealth)...');
+  const BRIDGE_ADDR = process.env.PROXY_HOST ? `socks5://127.0.0.1:${BRIDGE_PORT}` : undefined;
+  const { browser, context } = await launchStealthBrowser(
+    true,
+    BRIDGE_ADDR
+  );
+
   try {
-    // SocksProxyAgent already imported at top level
+    const page = await context.newPage();
+    applyStealthToPage(page);
+
+    await page.goto('https://app.topsurveys.app/app-login', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(1000);
+
+    // Fill email
+    await page.locator('input[type="email"]').fill(EMAIL);
+    await page.locator('[data-test-id="app-page-continue-button"]').click();
+    await page.waitForTimeout(2000);
+
+    // Fill password
+    await page.locator('input[type="password"]').fill(PASSWORD);
+    await page.locator('[data-test="auth-signin-submit"]').click();
+    await page.waitForTimeout(5000);
+
+    // Get ALL cookies from the session (not just auth-token)
+    const cookies = await page.context().cookies();
+    savedCookies = cookies;
     
-    // Login via API through bridge (cloudflare-clean US IP)
-    const resp = await (fetch as any)('https://api.topsurveys.app/auth/login', {
-      agent: socksAgent,
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({
-        email: EMAIL,
-        password: PASSWORD,
-        locale: 'en',
-        locale_v2: 'en-US',
-        platform: 'web',
-        timezone: 'Europe/London',
-      })
+    // Also save localStorage and sessionStorage for SPA auth
+    savedLocalStorage = await page.evaluate(() => {
+      const items: Record<string, string> = {};
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key) items[key] = localStorage.getItem(key) || '';
+      }
+      return items;
+    });
+    savedSessionStorage = await page.evaluate(() => {
+      const items: Record<string, string> = {};
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i);
+        if (key) items[key] = sessionStorage.getItem(key) || '';
+      }
+      return items;
     });
     
-    const body = await resp.text();
-    
-    if (!resp.ok) {
-      const msg = body.includes('incorrect') ? 'Invalid credentials' :
-                  body.includes('rate') ? 'Account temporarily locked' :
-                  `Login failed (HTTP ${resp.status})`;
-      throw new Error(msg);
+    const authCookie = cookies.find(c => c.name === 'auth-token');
+
+    if (!authCookie) {
+      throw new Error('Login failed - no auth-token cookie');
     }
-    
-    const data = JSON.parse(body);
-    if (!data.token) throw new Error('No token in login response');
-    
-    authToken = data.token;
+
+    authToken = decodeURIComponent(authCookie.value);
     loggedIn = true;
-    console.log('[login] success, token:', authToken.substring(0, 30) + '...');
-    
-    // Fetch dashboard data via API calls through bridge
+    console.log('[login] success, token:', authToken.substring(0, 20) + '...');
+
+    // Fetch dashboard data
     await refreshDashboard();
     return authToken;
-  } catch (err: any) {
-    console.log('[login] error:', err.message);
-    // Rate limited / account locked - wait before retry
-    if (err.message.includes('locked') || err.message.includes('rate')) {
-      console.log('[login] account rate-limited, waiting 5min before next attempt');
-      await new Promise(r => setTimeout(r, 300000)); // 5min
-    } else if (err.message.includes('Invalid')) {
-      console.log('[login] invalid credentials - will keep retrying in case lock clears');
-      await new Promise(r => setTimeout(r, 60000)); // 1min
-    }
-    throw err;
+  } finally {
+    await browser.close().catch(() => {});
   }
 }
-
-// ─── Scrape dashboard page for available surveys ──────────────────────
 
 async function refreshDashboard(): Promise<boolean> {
   if (!authToken) return false;
@@ -330,9 +331,10 @@ async function scrapeSurveys(): Promise<any[]> {
     await new Promise(r => setTimeout(r, 1000));
     
     console.log('[scrape] launching browser (stealth)...');
+    const BRIDGE_ADDR = process.env.PROXY_HOST ? `socks5://127.0.0.1:${BRIDGE_PORT}` : undefined;
     const { browser, context } = await launchStealthBrowser(
       true,
-      '' // Use proxy rotation (Bright Data > Webshare)
+      BRIDGE_ADDR
     );
 
     try {
@@ -346,11 +348,13 @@ async function scrapeSurveys(): Promise<any[]> {
         console.log('[scrape] 0 cards found — trying fresh login fallback...');
         await browser.close().catch(() => {});
         
-        const browser2 = await launchStealthBrowser(true, '');
+        const browser2 = await chromium.launch({
+          headless: true,
+          proxy: { server: `socks5://127.0.0.1:${BRIDGE_PORT}` },
+          args: ['--no-sandbox'],
+        });
         try {
-          const { context } = browser2;
-          const page2 = await context.newPage();
-          applyStealthToPage(page2);
+          const page2 = await browser2.newPage();
           
           // Fresh login
           await page2.goto('https://app.topsurveys.app/app-login', { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -382,19 +386,13 @@ async function scrapeSurveys(): Promise<any[]> {
             return items;
           });
           
-          const freshSurveys = await attemptScrape(browser2.browser, page2);
-          await browser2.browser.close().catch(() => {});
+          const freshSurveys = await attemptScrape(browser2, page2);
+          await browser2.close().catch(() => {});
           return freshSurveys;
         } catch {
-          await browser2.browser.close().catch(() => {});
+          await browser2.close().catch(() => {});
           return [];
         }
-      }
-      
-      // If browser-based scraping still finds 0, try API directly through US bridge
-      if (surveys.length === 0) {
-        const apiSurveys = await scrapeSurveysViaApi();
-        if (apiSurveys.length > 0) return apiSurveys;
       }
       
       await browser.close().catch(() => {});
@@ -405,71 +403,6 @@ async function scrapeSurveys(): Promise<any[]> {
       return [];
     }
   } catch {
-    return [];
-  }
-}
-
-/**
- * Fallback: fetch surveys via API directly through US bridge.
- * This bypasses the VPN detection that blocks browser-based scraping.
- */
-async function scrapeSurveysViaApi(): Promise<any[]> {
-  if (!authToken) return [];
-  try {
-    // Helper: fetch through SOCKS5 bridge
-    async function bridgeFetch(url: string, opts: any = {}): Promise<Response> {
-      opts.agent = socksAgent;
-      return (fetch as any)(url, opts) as Promise<Response>;
-    }
-    
-    // First init the prime surveys app session
-    const appResp = await bridgeFetch('https://api.primesurveys.com/v1/app?cn=USD', {
-      headers: { Authorization: 'Bearer ' + authToken, Accept: 'application/json' }
-    });
-    if (!appResp.ok) {
-      console.log('[api-scrape] v1/app failed:', appResp.status);
-      return [];
-    }
-    
-    // Now call surveys endpoint through US bridge
-    const surveyResp = await bridgeFetch('https://api.primesurveys.com/surveys', {
-      headers: {
-        Authorization: 'Bearer ' + authToken,
-        'x-fb-st': authToken,
-        'x-user-platform': 'web',
-        'x-user-locale': 'en-US',
-        Accept: 'application/json',
-        Referer: 'https://app.topsurveys.app/'
-      }
-    });
-    
-    const body = await surveyResp.text();
-    console.log('[api-scrape] surveys API response:', surveyResp.status, body.substring(0, 300));
-    
-    if (!surveyResp.ok) return [];
-    
-    const data = JSON.parse(body);
-    if (data.result === 'error') {
-      console.log('[api-scrape] API error:', data.type);
-      return [];
-    }
-    
-    // Parse survey items from API response
-    const surveys = data.surveys || data.data || [];
-    if (surveys.length > 0) {
-      scrapedSurveys = surveys.map((s: any) => ({
-        id: s.id || s.uuid,
-        name: s.title || s.name || 'Survey',
-        reward: s.reward || s.payout || '€0.00',
-        duration: s.duration || s.loi || '5 min',
-        type: 'survey',
-      }));
-      console.log('[api-scrape] found', scrapedSurveys.length, 'surveys via API');
-    }
-    
-    return scrapedSurveys;
-  } catch (err: any) {
-    console.log('[api-scrape] error:', err?.message || err);
     return [];
   }
 }
@@ -1034,9 +967,10 @@ async function openAndTakeSurvey(ctx: any, preferredSurvey: any, chatId: number)
     await new Promise(r => setTimeout(r, 1000));
 
     console.log('[survey] launching browser (stealth)...');
+    const BRIDGE_ADDR = process.env.PROXY_HOST ? `socks5://127.0.0.1:${BRIDGE_PORT}` : undefined;
     const { browser, context: surveyContext } = await launchStealthBrowser(
       true,
-      '' // Use proxy rotation
+      BRIDGE_ADDR
     );
 
     try {
@@ -1722,68 +1656,6 @@ except:
   }
   bot.launch();
   console.log('[topsurveys-bot] running');
-  
-  // Auto-start survey loop if logged in
-  if (loggedIn && !running) {
-    running = true;
-    sessionHistory = { totalCompleted: 0, totalScreened: 0, totalErrors: 0, totalEarned: 0, startTime: Date.now(), currentSurveyLabel: '' };
-    const chatId = ADMIN_ID;
-    console.log('[auto] starting survey loop...');
-    
-    (async () => {
-      try {
-        while (running) {
-          const authOk = await ensureLoggedIn();
-          if (!authOk) {
-            console.log('[auto] login failed, stopping');
-            running = false;
-            break;
-          }
-          
-          await refreshDashboard();
-          await scrapeSurveys();
-          
-          if (scrapedSurveys.length === 0) {
-            console.log('[auto] no surveys, waiting 30s');
-            for (let i = 0; i < 30 && running; i++) await new Promise(r => setTimeout(r, 1000));
-            continue;
-          }
-          
-          const realSurveys = scrapedSurveys
-            .filter((s: any) => s.type !== 'onboarding' && s.duration)
-            .sort((a: any, b: any) => parseDurationMinutes(a.duration) - parseDurationMinutes(b.duration));
-          
-          if (realSurveys.length === 0) {
-            console.log('[auto] no payable surveys, waiting 30s');
-            for (let i = 0; i < 30 && running; i++) await new Promise(r => setTimeout(r, 1000));
-            continue;
-          }
-          
-          console.log(`[auto] found ${realSurveys.length} survey(s)`);
-          
-          for (const survey of realSurveys) {
-            if (!running) break;
-            // Use a minimal ctx-like object for status messages
-            const fakeCtx = { telegram: bot.telegram, chat: { id: chatId } };
-            const result = await openAndTakeSurvey(fakeCtx as any, survey, chatId);
-            if (result.completed) {
-              console.log(`[auto] completed survey: ${result.reward}`);
-            } else {
-              console.log(`[auto] survey failed/screened`);
-            }
-            // 15s pause between surveys
-            for (let i = 0; i < 15 && running; i++) await new Promise(r => setTimeout(r, 1000));
-          }
-          
-          console.log('[auto] batch done, waiting 30s');
-          for (let i = 0; i < 30 && running; i++) await new Promise(r => setTimeout(r, 1000));
-        }
-      } catch (err: any) {
-        console.log('[auto] error:', err.message);
-        running = false;
-      }
-    })();
-  }
 })();
 
 async function ensureLoggedIn(): Promise<boolean> {
