@@ -1,56 +1,39 @@
 /**
- * Local unauthenticated SOCKS5 proxy → remote authenticated SOCKS5 proxy
- * Listens on localhost:10801, forwards to 159.100.17.112:9000 with auth
+ * Local SOCKS5 proxy → HTTP CONNECT tunnel via Bright Data proxy
+ * Listens on localhost:10801 (SOCKS5), forwards via HTTP proxy to target host
  */
 
 import net from 'net';
 import { config } from 'dotenv';
 
-config(); // Load .env
+config();
 
 const LOCAL_PORT = parseInt(process.env.BRIDGE_LOCAL_PORT || '10801');
-const REMOTE_HOST = process.env.PROXY_HOST || '159.100.17.112';
-const REMOTE_PORT = parseInt(process.env.PROXY_PORT || '9000');
-const REMOTE_USER = process.env.PROXY_USER || 'kelvin';
-const REMOTE_PASS = process.env.PROXY_PASS || 'kelvin';
+const PROXY_HOST = process.env.PROXY_HOST || 'brd.superproxy.io';
+const PROXY_PORT = parseInt(process.env.PROXY_PORT || '33335');
+const PROXY_USER = process.env.PROXY_USER || '';
+const PROXY_PASS = process.env.PROXY_PASS || '';
 
-console.log(`🔄 SOCKS5 bridge: 127.0.0.1:${LOCAL_PORT} (no auth) → ${REMOTE_HOST}:${REMOTE_PORT}`);
+console.log(`🔄 SOCKS5 bridge: 127.0.0.1:${LOCAL_PORT} → HTTP proxy ${PROXY_HOST}:${PROXY_PORT}`);
 
-const server = net.createServer(localConn => {
+const server = net.createServer(localSocket => {
   let state = 'greeting';
   let buf = Buffer.alloc(0);
-  let remoteConn = null;
-  let addrInfo = { type: 1, addr: '0.0.0.0', port: 0 };
+  let remoteSocket = null;
+  let targetHost = '';
+  let targetPort = 0;
 
   function cleanup() {
-    try { localConn.destroy(); } catch {}
-    if (remoteConn) { try { remoteConn.destroy(); } catch {} remoteConn = null; }
+    try { localSocket.destroy(); } catch {}
+    if (remoteSocket) { try { remoteSocket.destroy(); } catch {} remoteSocket = null; }
   }
 
-  function sendReply(rep) {
-    let reply;
-    if (addrInfo.type === 1) {
-      const parts = addrInfo.addr.split('.').map(Number);
-      reply = Buffer.alloc(10);
-      reply[0] = 5; reply[1] = rep; reply[2] = 0; reply[3] = 1;
-      for (let i = 0; i < 4; i++) reply[4 + i] = parts[i];
-      reply[8] = (addrInfo.port >> 8) & 0xff;
-      reply[9] = addrInfo.port & 0xff;
-    } else if (addrInfo.type === 3) {
-      const d = Buffer.from(addrInfo.addr, 'ascii');
-      reply = Buffer.alloc(7 + d.length);
-      reply[0] = 5; reply[1] = rep; reply[2] = 0; reply[3] = 3;
-      reply[4] = d.length;
-      d.copy(reply, 5);
-      reply[5 + d.length] = (addrInfo.port >> 8) & 0xff;
-      reply[6 + d.length] = addrInfo.port & 0xff;
-    } else {
-      reply = Buffer.from([5, rep, 0, 1, 0, 0, 0, 0, 0, 0]);
-    }
-    try { localConn.write(reply); } catch {}
+  function sendSocks5Reply(rep) {
+    const reply = Buffer.from([5, rep, 0, 1, 0, 0, 0, 0, 0, 0]);
+    try { localSocket.write(reply); } catch {}
   }
 
-  localConn.on('data', function onLocalData(data) {
+  localSocket.on('data', (data) => {
     buf = Buffer.concat([buf, data]);
 
     if (state === 'greeting') {
@@ -58,175 +41,120 @@ const server = net.createServer(localConn => {
       if (buf[0] !== 5) { cleanup(); return; }
       const nmethods = buf[1];
       if (buf.length < 2 + nmethods) return;
-      localConn.write(Buffer.from([5, 0x00])); // no auth
+      localSocket.write(Buffer.from([5, 0x00]));
       buf = buf.slice(2 + nmethods);
       state = 'request';
-      if (buf.length > 0) onLocalData(Buffer.alloc(0));
+      if (buf.length > 0) localSocket.emit('data', Buffer.alloc(0));
       return;
     }
 
     if (state === 'request') {
       if (buf.length < 4) return;
-      if (buf[1] !== 1) { sendReply(0x07); cleanup(); return; } // only CONNECT
-      addrInfo.type = buf[3];
+      if (buf[1] !== 1) { sendSocks5Reply(0x07); cleanup(); return; }
+      const addrType = buf[3];
 
-      if (addrInfo.type === 1) {
+      if (addrType === 1) {
         if (buf.length < 10) return;
-        addrInfo.addr = `${buf[4]}.${buf[5]}.${buf[6]}.${buf[7]}`;
-        addrInfo.port = (buf[8] << 8) | buf[9];
+        targetHost = `${buf[4]}.${buf[5]}.${buf[6]}.${buf[7]}`;
+        targetPort = (buf[8] << 8) | buf[9];
         buf = buf.slice(10);
-      } else if (addrInfo.type === 3) {
+      } else if (addrType === 3) {
         if (buf.length < 5) return;
-        const dLen = buf[4];
-        if (buf.length < 7 + dLen) return;
-        addrInfo.addr = buf.slice(5, 5 + dLen).toString('ascii');
-        addrInfo.port = (buf[5 + dLen] << 8) | buf[6 + dLen];
-        buf = buf.slice(7 + dLen);
-      } else if (addrInfo.type === 4) {
-        if (buf.length < 22) return;
-        const parts = [];
-        for (let i = 0; i < 8; i++) parts.push(((buf[4 + i * 2] << 8) | buf[5 + i * 2]).toString(16));
-        addrInfo.addr = parts.join(':');
-        addrInfo.port = (buf[20] << 8) | buf[21];
-        buf = buf.slice(22);
+        const domainLen = buf[4];
+        if (buf.length < 7 + domainLen) return;
+        targetHost = buf.slice(5, 5 + domainLen).toString('utf8');
+        targetPort = (buf[5 + domainLen] << 8) | buf[6 + domainLen];
+        buf = buf.slice(7 + domainLen);
       } else {
-        sendReply(0x08); cleanup(); return;
+        sendSocks5Reply(0x08); cleanup(); return;
       }
 
       state = 'connecting';
+      console.log(`[bridge] Connecting to ${PROXY_HOST}:${PROXY_PORT} for target ${targetHost}:${targetPort}`);
 
-      // Connect to remote SOCKS5 proxy
-      remoteConn = net.createConnection({ host: REMOTE_HOST, port: REMOTE_PORT }, () => {
-        // Send SOCKS5 greeting asking for username/password auth
-        remoteConn.write(Buffer.from([5, 1, 0x02])); // 1 method, method=2 (user/pass)
+      remoteSocket = net.createConnection({ host: PROXY_HOST, port: PROXY_PORT }, () => {
+        const authHeader = PROXY_USER && PROXY_PASS
+          ? `Basic ${Buffer.from(`${PROXY_USER}:${PROXY_PASS}`).toString('base64')}`
+          : '';
+        const connectRequest = [
+          `CONNECT ${targetHost}:${targetPort} HTTP/1.1`,
+          `Host: ${targetHost}:${targetPort}`,
+          authHeader ? `Proxy-Authorization: ${authHeader}` : '',
+          'Connection: Keep-Alive',
+          '',  // This empty line MUST stay — produces trailing \r\n\r\n
+          '',
+        ].join('\r\n');
+
+        console.log('[bridge] Sending CONNECT request');
+        remoteSocket.write(connectRequest);
       });
 
-      let rBuf = Buffer.alloc(0);
-      let rStage = 'greeting';
+      let responseBuf = Buffer.alloc(0);
+      let headersEnded = false;
+      let statusCode = 0;
 
-      remoteConn.on('data', function onRemoteData(rData) {
-        rBuf = Buffer.concat([rBuf, rData]);
+      remoteSocket.on('data', (chunk) => {
+        console.log('[bridge] Raw response from proxy:', chunk.toString('utf8').slice(0, 300));
+        responseBuf = Buffer.concat([responseBuf, chunk]);
 
-        if (rStage === 'greeting') {
-          if (rBuf.length < 2) return;
-          const rMethod = rBuf[1];
-          rBuf = rBuf.slice(2);
+        if (!headersEnded) {
+          const headersEnd = responseBuf.indexOf('\r\n\r\n');
+          if (headersEnd === -1) return;
 
-          if (rMethod === 0xff) { cleanup(); return; }
+          const headerPart = responseBuf.slice(0, headersEnd).toString('utf8');
+          const statusLine = headerPart.split('\r\n')[0];
+          console.log('[bridge] Status line:', statusLine);
 
-          // Send username/password auth
-          const uBuf = Buffer.from(REMOTE_USER, 'utf8');
-          const pBuf = Buffer.from(REMOTE_PASS, 'utf8');
-          const authReq = Buffer.alloc(3 + uBuf.length + pBuf.length);
-          authReq[0] = 1;
-          authReq[1] = uBuf.length;
-          uBuf.copy(authReq, 2);
-          authReq[2 + uBuf.length] = pBuf.length;
-          pBuf.copy(authReq, 3 + uBuf.length);
-          remoteConn.write(authReq);
-          rStage = 'auth';
-          if (rBuf.length > 0) onRemoteData(Buffer.alloc(0));
-          return;
-        }
+          const statusMatch = statusLine.match(/HTTP\/1\.1\s+(\d{3})/);
+          if (statusMatch) {
+            statusCode = parseInt(statusMatch[1], 10);
+          }
+          console.log(`[bridge] Parsed HTTP status: ${statusCode}`);
 
-        if (rStage === 'auth') {
-          if (rBuf.length < 2) return;
-          const aStatus = rBuf[1];
-          rBuf = rBuf.slice(2);
+          responseBuf = responseBuf.slice(headersEnd + 4);
+          headersEnded = true;
 
-          if (aStatus !== 0) {
-            sendReply(0x01);
+          if (statusCode === 200) {
+            console.log('[bridge] Tunnel established successfully');
+            sendSocks5Reply(0);
+            state = 'tunneling';
+
+            if (responseBuf.length > 0) {
+              try { localSocket.write(responseBuf); } catch {}
+            }
+
+            localSocket.pipe(remoteSocket);
+            remoteSocket.pipe(localSocket);
+          } else {
+            console.log('[bridge] Proxy returned non-200, failing');
+            sendSocks5Reply(0x01);
             cleanup();
-            return;
           }
-
-          // Auth OK. Send the actual CONNECT request to the target
-          rStage = 'connect';
-          const req = buildConnectRequest();
-          remoteConn.write(req);
-          if (rBuf.length > 0) onRemoteData(Buffer.alloc(0));
-          return;
-        }
-
-        if (rStage === 'connect') {
-          if (rBuf.length < 4) return;
-          const rep = rBuf[1];
-
-          let hdrLen;
-          if (rBuf[3] === 1) hdrLen = 10;
-          else if (rBuf[3] === 3) hdrLen = 7 + rBuf[4];
-          else if (rBuf[3] === 4) hdrLen = 22;
-          else hdrLen = 10;
-
-          if (rBuf.length < hdrLen) return;
-          rBuf = rBuf.slice(hdrLen);
-
-          if (rep !== 0) {
-            sendReply(rep);
-            cleanup();
-            return;
-          }
-
-          // ✅ Success! Tell the local client
-          sendReply(0);
-          state = 'pipe';
-
-          // Forward any buffered data from remote → local
-          if (rBuf.length > 0) {
-            try { localConn.write(rBuf); } catch {}
-          }
-
-          // Remove data handlers and set up raw piping
-          remoteConn.removeListener('data', onRemoteData);
-          localConn.removeListener('data', onLocalData);
-
-          localConn.pipe(remoteConn);
-          remoteConn.pipe(localConn);
-          return;
         }
       });
 
-      remoteConn.on('error', () => { sendReply(0x01); cleanup(); });
-      remoteConn.on('close', () => { cleanup(); });
+      remoteSocket.on('error', (err) => {
+        console.log('[bridge] Remote socket error:', err.message);
+        sendSocks5Reply(0x01);
+        cleanup();
+      });
+
+      remoteSocket.on('end', () => {
+        console.log('[bridge] Remote socket ended');
+        cleanup();
+      });
+
+      remoteSocket.on('close', () => {
+        console.log('[bridge] Remote socket closed');
+        cleanup();
+      });
+
       return;
     }
   });
 
-  function buildConnectRequest() {
-    const { type, addr, port } = addrInfo;
-    let req;
-    if (type === 1) {
-      req = Buffer.alloc(10);
-      req[0] = 5; req[1] = 1; req[2] = 0; req[3] = 1;
-      const parts = addr.split('.').map(Number);
-      for (let i = 0; i < 4; i++) req[4 + i] = parts[i];
-      req[8] = (port >> 8) & 0xff;
-      req[9] = port & 0xff;
-    } else if (type === 3) {
-      const d = Buffer.from(addr, 'ascii');
-      req = Buffer.alloc(7 + d.length);
-      req[0] = 5; req[1] = 1; req[2] = 0; req[3] = 3;
-      req[4] = d.length;
-      d.copy(req, 5);
-      req[5 + d.length] = (port >> 8) & 0xff;
-      req[6 + d.length] = port & 0xff;
-    } else if (type === 4) {
-      req = Buffer.alloc(22);
-      req[0] = 5; req[1] = 1; req[2] = 0; req[3] = 4;
-      const parts = addr.split(':');
-      for (let i = 0; i < 8; i++) {
-        const n = parseInt(parts[i] || '0', 16);
-        req[4 + i * 2] = (n >> 8) & 0xff;
-        req[5 + i * 2] = n & 0xff;
-      }
-      req[20] = (port >> 8) & 0xff;
-      req[21] = port & 0xff;
-    }
-    return req;
-  }
-
-  localConn.on('error', cleanup);
-  localConn.on('close', cleanup);
+  localSocket.on('error', cleanup);
+  localSocket.on('close', cleanup);
 });
 
 server.listen(LOCAL_PORT, '127.0.0.1', () => {

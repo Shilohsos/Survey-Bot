@@ -1,0 +1,7 @@
+◇ injected env (16) from .env // tip: ⌘ suppress logs { quiet: true }
+🔄 SOCKS5 bridge: 127.0.0.1:10801 → HTTP proxy brd.superproxy.io:33335
+✅ Bridge ready on 127.0.0.1:10801
+[bridge] Connecting to brd.superproxy.io:33335 for target 3.94.72.89:443
+[bridge] Sending CONNECT request
+[bridge] Remote socket ended
+[bridge] Remote socket closed
